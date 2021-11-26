@@ -126,6 +126,8 @@ public class RaftContext implements AutoCloseable, HealthMonitorable {
   private final Random random;
   private PersistedSnapshot currentSnapshot;
 
+  private boolean ongoingTransition = false;
+
   @SuppressWarnings("java:S3077") // allow volatile here, health is immutable
   private volatile HealthReport health = HealthReport.healthy(this);
 
@@ -298,7 +300,18 @@ public class RaftContext implements AutoCloseable, HealthMonitorable {
    * @param listener The role change listener.
    */
   public void addRoleChangeListener(final RaftRoleChangeListener listener) {
-    roleChangeListeners.add(listener);
+    threadContext.execute(
+        () -> {
+          roleChangeListeners.add(listener);
+
+          // When a transition is currently ongoing, then the given
+          // listener will be called when the transition completes.
+          if (!ongoingTransition) {
+            // Otherwise, the listener will called directly for the last
+            // completed transition.
+            listener.onNewRole(getRole(), getTerm());
+          }
+        });
   }
 
   /**
@@ -589,6 +602,8 @@ public class RaftContext implements AutoCloseable, HealthMonitorable {
 
     log.info("Transitioning to {}", role);
 
+    startTransition();
+
     // Close the old state.
     try {
       this.role.stop().get();
@@ -618,12 +633,24 @@ public class RaftContext implements AutoCloseable, HealthMonitorable {
             () -> {
               if (this.role == leaderRole) { // ensure no other role change happened in between
                 notifyRoleChangeListeners();
+                // Transitioning to leader completes
+                // once the initial entry gets committed
+                completeTransition();
               }
             });
       } else {
         notifyRoleChangeListeners();
+        completeTransition();
       }
     }
+  }
+
+  private void startTransition() {
+    ongoingTransition = true;
+  }
+
+  private void completeTransition() {
+    ongoingTransition = false;
   }
 
   private void notifyRoleChangeListeners() {
